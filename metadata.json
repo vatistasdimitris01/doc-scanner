@@ -1,0 +1,7 @@
+{
+  "name": "React Smart Document Scanner",
+  "description": "A web-based document scanner using your device's camera to detect, highlight, and extract documents in real-time. Built with React, TypeScript, and Tailwind CSS.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
