@@ -56,27 +56,36 @@ const App: React.FC = () => {
         const displayCtx = displayCanvas.getContext('2d');
         const cv = window.cv;
 
+        // --- Performance Optimization ---
+        // Process a smaller image for faster detection.
+        const PROCESSING_WIDTH = 480;
+        const scaleFactor = video.videoWidth / PROCESSING_WIDTH;
+        const PROCESSING_HEIGHT = video.videoHeight / scaleFactor;
+        // Dynamically set minimum area based on processed image size.
+        const MIN_CONTOUR_AREA = (PROCESSING_WIDTH * PROCESSING_HEIGHT) * 0.05;
+
         const loop = () => {
             if (!captureCtx || !displayCtx || !cv) {
                 animationFrameIdRef.current = requestAnimationFrame(loop);
                 return;
             };
 
-            // Draw video to capture canvas
+            // Draw video to a full-sized canvas for capturing
             captureCtx.drawImage(video, 0, 0, captureCanvas.width, captureCanvas.height);
             
-            // --- Advanced OpenCV Processing Pipeline ---
             const src = cv.imread(captureCanvas);
+            const downscaled = new cv.Mat();
+            const dsize = new cv.Size(PROCESSING_WIDTH, PROCESSING_HEIGHT);
+            // Use INTER_AREA for quality downscaling
+            cv.resize(src, downscaled, dsize, 0, 0, cv.INTER_AREA);
+
             const gray = new cv.Mat();
-            cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+            cv.cvtColor(downscaled, gray, cv.COLOR_RGBA2GRAY);
             const blurred = new cv.Mat();
-            cv.GaussianBlur(gray, blurred, new cv.Size(5, 5), 0);
-
-            // Use adaptive thresholding for better edge detection in varying light
+            cv.GaussianBlur(gray, blurred, new cv.Size(7, 7), 0);
             const thresh = new cv.Mat();
-            cv.adaptiveThreshold(blurred, thresh, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 11, 2);
-
-            // Use morphological closing to connect broken edges of the document
+            // Refined adaptive threshold parameters for more robust edge detection
+            cv.adaptiveThreshold(blurred, thresh, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 15, 4);
             const kernel = cv.Mat.ones(5, 5, cv.CV_8U);
             const closing = new cv.Mat();
             cv.morphologyEx(thresh, closing, cv.MORPH_CLOSE, kernel);
@@ -91,12 +100,11 @@ const App: React.FC = () => {
             for (let i = 0; i < contours.size(); ++i) {
                 const cnt = contours.get(i);
                 const area = cv.contourArea(cnt);
-                if (area > 10000) { // Filter small noise
+                if (area > MIN_CONTOUR_AREA) { // Filter small noise
                     const peri = cv.arcLength(cnt, true);
                     const approx = new cv.Mat();
                     cv.approxPolyDP(cnt, approx, 0.02 * peri, true);
 
-                    // Check for 4 corners and convexity for better accuracy
                     if (approx.rows === 4 && cv.isContourConvex(approx) && area > maxArea) {
                         maxArea = area;
                         paperContour = approx.clone();
@@ -106,37 +114,33 @@ const App: React.FC = () => {
                 cnt.delete();
             }
             
-            // Draw video feed to display canvas
             displayCtx.drawImage(video, 0, 0, displayCanvas.width, displayCanvas.height);
 
             if (paperContour) {
-                // Fix: Cast paperContour.data32S to number[] to resolve TypeScript type inference issues.
-                // Because `window.cv` is typed as `any`, `paperContour.data32S` is also `any`.
-                // `Array.from(any)` returns `unknown[]`, causing type errors when accessing array elements.
-                const corners: Point[] = Array.from(paperContour.data32S as number[]).reduce<Point[]>((acc, _, i, arr) => {
+                // Scale corners back to the original canvas size
+                const unscaledCorners: Point[] = Array.from(paperContour.data32S as number[]).reduce<Point[]>((acc, _, i, arr) => {
                     if (i % 2 === 0) {
                         acc.push({ x: arr[i], y: arr[i + 1] });
                     }
                     return acc;
                 }, []);
+                const scaledCorners: Point[] = unscaledCorners.map(p => ({ x: p.x * scaleFactor, y: p.y * scaleFactor }));
 
                 const dist = (p1: Point, p2: Point) => Math.hypot(p2.x - p1.x, p2.y - p1.y);
-                const w1 = dist(corners[0], corners[1]);
-                const w2 = dist(corners[2], corners[3]);
-                const h1 = dist(corners[1], corners[2]);
-                const h2 = dist(corners[3], corners[0]);
+                const w1 = dist(scaledCorners[0], scaledCorners[1]);
+                const w2 = dist(scaledCorners[2], scaledCorners[3]);
+                const h1 = dist(scaledCorners[1], scaledCorners[2]);
+                const h2 = dist(scaledCorners[3], scaledCorners[0]);
                 const avgWidth = (w1 + w2) / 2;
                 const avgHeight = (h1 + h2) / 2;
                 const aspectRatio = Math.max(avgWidth, avgHeight) / Math.min(avgWidth, avgHeight);
                 
-                // A4/Letter papers have an aspect ratio of ~1.41 / ~1.29.
-                // We check for a range to account for perspective distortion.
                 if (aspectRatio > 1.2 && aspectRatio < 1.8) {
-                    setDetectedCorners(corners);
+                    setDetectedCorners(scaledCorners);
                     displayCtx.beginPath();
-                    displayCtx.moveTo(corners[0].x, corners[0].y);
-                    for(let i = 1; i < corners.length; i++) {
-                        displayCtx.lineTo(corners[i].x, corners[i].y);
+                    displayCtx.moveTo(scaledCorners[0].x, scaledCorners[0].y);
+                    for(let i = 1; i < scaledCorners.length; i++) {
+                        displayCtx.lineTo(scaledCorners[i].x, scaledCorners[i].y);
                     }
                     displayCtx.closePath();
                     displayCtx.lineWidth = 8;
@@ -151,7 +155,7 @@ const App: React.FC = () => {
             }
 
             // Cleanup OpenCV Mats
-            src.delete(); gray.delete(); blurred.delete(); thresh.delete(); kernel.delete(); closing.delete(); contours.delete(); hierarchy.delete();
+            src.delete(); downscaled.delete(); gray.delete(); blurred.delete(); thresh.delete(); kernel.delete(); closing.delete(); contours.delete(); hierarchy.delete();
 
             animationFrameIdRef.current = requestAnimationFrame(loop);
         };
@@ -244,6 +248,8 @@ const App: React.FC = () => {
         // Cleanup
         srcMat.delete(); dst.delete(); M.delete(); srcTri.delete(); dstTri.delete();
     };
+
+
 
     const handleRescan = () => {
         setScannedImage(null);
