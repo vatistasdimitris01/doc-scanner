@@ -1,7 +1,13 @@
-
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { AppState } from './types';
-import type { JScanify } from './types';
+import { AppState, Point } from './types';
+
+// Helper function to order corner points for perspective transform
+const orderPoints = (points: Point[]): Point[] => {
+  const rect: Point[] = [...points].sort((a, b) => a.y - b.y);
+  const top = [rect[0], rect[1]].sort((a, b) => a.x - b.x);
+  const bottom = [rect[2], rect[3]].sort((a, b) => a.x - b.x);
+  return [top[0], top[1], bottom[1], bottom[0]]; // tl, tr, br, bl
+};
 
 const LoadingSpinner: React.FC = () => (
   <svg className="animate-spin h-8 w-8 text-teal-400" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
@@ -26,11 +32,11 @@ const App: React.FC = () => {
     const [appState, setAppState] = useState<AppState>(AppState.LOADING);
     const [error, setError] = useState<string | null>(null);
     const [scannedImage, setScannedImage] = useState<string | null>(null);
+    const [detectedCorners, setDetectedCorners] = useState<Point[] | null>(null);
 
     const videoRef = useRef<HTMLVideoElement>(null);
     const captureCanvasRef = useRef<HTMLCanvasElement>(null);
     const displayCanvasRef = useRef<HTMLCanvasElement>(null);
-    const scannerRef = useRef<JScanify | null>(null);
     const animationFrameIdRef = useRef<number | null>(null);
 
     const stopScanLoop = useCallback(() => {
@@ -41,21 +47,112 @@ const App: React.FC = () => {
     }, []);
 
     const startScanLoop = useCallback(() => {
-        if (!videoRef.current || !captureCanvasRef.current || !displayCanvasRef.current || !scannerRef.current) return;
+        if (!videoRef.current || !captureCanvasRef.current || !displayCanvasRef.current) return;
         
         const video = videoRef.current;
         const captureCanvas = captureCanvasRef.current;
         const displayCanvas = displayCanvasRef.current;
-        const captureCtx = captureCanvas.getContext('2d');
+        const captureCtx = captureCanvas.getContext('2d', { willReadFrequently: true });
         const displayCtx = displayCanvas.getContext('2d');
-        const scanner = scannerRef.current;
+        const cv = window.cv;
 
         const loop = () => {
-            if (captureCtx && displayCtx) {
-                captureCtx.drawImage(video, 0, 0, captureCanvas.width, captureCanvas.height);
-                const highlightedCanvas = scanner.highlightPaper(captureCanvas, { color: "#00bfa6", thickness: 8 });
-                displayCtx.drawImage(highlightedCanvas, 0, 0, displayCanvas.width, displayCanvas.height);
+            if (!captureCtx || !displayCtx || !cv) {
+                animationFrameIdRef.current = requestAnimationFrame(loop);
+                return;
+            };
+
+            // Draw video to capture canvas
+            captureCtx.drawImage(video, 0, 0, captureCanvas.width, captureCanvas.height);
+            
+            // --- Advanced OpenCV Processing Pipeline ---
+            const src = cv.imread(captureCanvas);
+            const gray = new cv.Mat();
+            cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+            const blurred = new cv.Mat();
+            cv.GaussianBlur(gray, blurred, new cv.Size(5, 5), 0);
+
+            // Use adaptive thresholding for better edge detection in varying light
+            const thresh = new cv.Mat();
+            cv.adaptiveThreshold(blurred, thresh, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 11, 2);
+
+            // Use morphological closing to connect broken edges of the document
+            const kernel = cv.Mat.ones(5, 5, cv.CV_8U);
+            const closing = new cv.Mat();
+            cv.morphologyEx(thresh, closing, cv.MORPH_CLOSE, kernel);
+
+            const contours = new cv.MatVector();
+            const hierarchy = new cv.Mat();
+            cv.findContours(closing, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+            let maxArea = 0;
+            let paperContour = null;
+
+            for (let i = 0; i < contours.size(); ++i) {
+                const cnt = contours.get(i);
+                const area = cv.contourArea(cnt);
+                if (area > 10000) { // Filter small noise
+                    const peri = cv.arcLength(cnt, true);
+                    const approx = new cv.Mat();
+                    cv.approxPolyDP(cnt, approx, 0.02 * peri, true);
+
+                    // Check for 4 corners and convexity for better accuracy
+                    if (approx.rows === 4 && cv.isContourConvex(approx) && area > maxArea) {
+                        maxArea = area;
+                        paperContour = approx.clone();
+                    }
+                    approx.delete();
+                }
+                cnt.delete();
             }
+            
+            // Draw video feed to display canvas
+            displayCtx.drawImage(video, 0, 0, displayCanvas.width, displayCanvas.height);
+
+            if (paperContour) {
+                // Fix: Cast paperContour.data32S to number[] to resolve TypeScript type inference issues.
+                // Because `window.cv` is typed as `any`, `paperContour.data32S` is also `any`.
+                // `Array.from(any)` returns `unknown[]`, causing type errors when accessing array elements.
+                const corners: Point[] = Array.from(paperContour.data32S as number[]).reduce<Point[]>((acc, _, i, arr) => {
+                    if (i % 2 === 0) {
+                        acc.push({ x: arr[i], y: arr[i + 1] });
+                    }
+                    return acc;
+                }, []);
+
+                const dist = (p1: Point, p2: Point) => Math.hypot(p2.x - p1.x, p2.y - p1.y);
+                const w1 = dist(corners[0], corners[1]);
+                const w2 = dist(corners[2], corners[3]);
+                const h1 = dist(corners[1], corners[2]);
+                const h2 = dist(corners[3], corners[0]);
+                const avgWidth = (w1 + w2) / 2;
+                const avgHeight = (h1 + h2) / 2;
+                const aspectRatio = Math.max(avgWidth, avgHeight) / Math.min(avgWidth, avgHeight);
+                
+                // A4/Letter papers have an aspect ratio of ~1.41 / ~1.29.
+                // We check for a range to account for perspective distortion.
+                if (aspectRatio > 1.2 && aspectRatio < 1.8) {
+                    setDetectedCorners(corners);
+                    displayCtx.beginPath();
+                    displayCtx.moveTo(corners[0].x, corners[0].y);
+                    for(let i = 1; i < corners.length; i++) {
+                        displayCtx.lineTo(corners[i].x, corners[i].y);
+                    }
+                    displayCtx.closePath();
+                    displayCtx.lineWidth = 8;
+                    displayCtx.strokeStyle = "#00bfa6";
+                    displayCtx.stroke();
+                } else {
+                   setDetectedCorners(null);
+                }
+                paperContour.delete();
+            } else {
+                setDetectedCorners(null);
+            }
+
+            // Cleanup OpenCV Mats
+            src.delete(); gray.delete(); blurred.delete(); thresh.delete(); kernel.delete(); closing.delete(); contours.delete(); hierarchy.delete();
+
             animationFrameIdRef.current = requestAnimationFrame(loop);
         };
         loop();
@@ -80,7 +177,6 @@ const App: React.FC = () => {
                             displayCanvasRef.current.width = videoWidth;
                             displayCanvasRef.current.height = videoHeight;
                             
-                            scannerRef.current = new window.jscanify();
                             setAppState(AppState.READY);
                             startScanLoop();
                         }
@@ -94,7 +190,7 @@ const App: React.FC = () => {
         };
 
         const libsCheckInterval = setInterval(() => {
-            if (window.cv && window.jscanify) {
+            if (window.cv) {
                 clearInterval(libsCheckInterval);
                 initScanner();
             }
@@ -108,35 +204,45 @@ const App: React.FC = () => {
                 stream.getTracks().forEach(track => track.stop());
             }
         };
-        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [startScanLoop, stopScanLoop]);
 
     const handleExtract = () => {
+        if (!detectedCorners || !captureCanvasRef.current || !window.cv) {
+            alert("No document detected. Please try again.");
+            return;
+        }
         stopScanLoop();
         setAppState(AppState.SCANNING);
 
-        if (videoRef.current && captureCanvasRef.current && scannerRef.current) {
-            const captureCanvas = captureCanvasRef.current;
-            const captureCtx = captureCanvas.getContext('2d');
-            
-            if(!captureCtx) {
-                setError("Could not get canvas context.");
-                setAppState(AppState.ERROR);
-                return;
-            }
+        const cv = window.cv;
+        const srcMat = cv.imread(captureCanvasRef.current);
+        
+        // Define output size (A4-like aspect ratio)
+        const outputWidth = 850;
+        const outputHeight = 1100;
 
-            captureCtx.drawImage(videoRef.current, 0, 0, captureCanvas.width, captureCanvas.height);
-            const extractedCanvas = scannerRef.current.extractPaper(captureCanvas, 850, 1100); // A4-like aspect ratio
-            
-            if (extractedCanvas) {
-                setScannedImage(extractedCanvas.toDataURL('image/jpeg'));
-                setAppState(AppState.PREVIEW);
-            } else {
-                alert("No document detected. Please try again.");
-                setAppState(AppState.READY);
-                startScanLoop();
-            }
-        }
+        const orderedCorners = orderPoints(detectedCorners);
+        const [tl, tr, br, bl] = orderedCorners;
+
+        const srcTri = cv.matFromArray(4, 1, cv.CV_32FC2, [tl.x, tl.y, tr.x, tr.y, br.x, br.y, bl.x, bl.y]);
+        const dstTri = cv.matFromArray(4, 1, cv.CV_32FC2, [0, 0, outputWidth, 0, outputWidth, outputHeight, 0, outputHeight]);
+        
+        const M = cv.getPerspectiveTransform(srcTri, dstTri);
+        const dst = new cv.Mat();
+        const dsize = new cv.Size(outputWidth, outputHeight);
+        
+        cv.warpPerspective(srcMat, dst, M, dsize, cv.INTER_LINEAR, cv.BORDER_CONSTANT, new cv.Scalar());
+
+        const resultCanvas = document.createElement('canvas');
+        resultCanvas.width = outputWidth;
+        resultCanvas.height = outputHeight;
+        cv.imshow(resultCanvas, dst);
+        
+        setScannedImage(resultCanvas.toDataURL('image/jpeg'));
+        setAppState(AppState.PREVIEW);
+
+        // Cleanup
+        srcMat.delete(); dst.delete(); M.delete(); srcTri.delete(); dstTri.delete();
     };
 
     const handleRescan = () => {
@@ -155,11 +261,13 @@ const App: React.FC = () => {
         document.body.removeChild(link);
     };
 
+    const isPaperDetected = detectedCorners !== null;
+
     return (
         <div className="min-h-screen w-full flex flex-col items-center justify-center p-4">
             <header className="w-full max-w-4xl text-center mb-4">
                 <h1 className="text-3xl sm:text-4xl font-bold text-teal-300">Smart Document Scanner</h1>
-                <p className="text-gray-400 mt-2">Point your camera at a document to see it highlighted in real-time.</p>
+                <p className="text-gray-400 mt-2">Point your camera at a document. The frame will be detected automatically.</p>
             </header>
 
             <main className="w-full max-w-4xl aspect-[4/3] sm:aspect-video bg-gray-800 rounded-xl shadow-2xl overflow-hidden relative flex items-center justify-center">
@@ -179,6 +287,14 @@ const App: React.FC = () => {
                 <video ref={videoRef} className="absolute top-0 left-0 w-full h-full object-cover -z-10 opacity-0" playsInline />
                 <canvas ref={captureCanvasRef} className="hidden" />
                 <canvas ref={displayCanvasRef} className="w-full h-full object-contain" />
+
+                {appState === AppState.READY && (
+                    <div className="absolute top-4 left-1/2 -translate-x-1/2 bg-black bg-opacity-60 text-white px-4 py-2 rounded-lg pointer-events-none transition-opacity duration-300">
+                      <span className={isPaperDetected ? 'text-teal-300 font-medium' : 'text-gray-300'}>
+                        {isPaperDetected ? "Paper Detected" : "Searching for document..."}
+                      </span>
+                    </div>
+                )}
                 
                 {appState === AppState.SCANNING && (
                     <div className="absolute inset-0 bg-black bg-opacity-70 flex flex-col items-center justify-center z-20">
@@ -207,7 +323,12 @@ const App: React.FC = () => {
 
             {appState === AppState.READY && (
                 <footer className="mt-6">
-                    <button onClick={handleExtract} className="flex items-center gap-3 px-8 py-4 bg-teal-500 hover:bg-teal-600 text-white text-lg font-bold rounded-full shadow-lg transition-transform transform hover:scale-105 focus:outline-none focus:ring-4 focus:ring-teal-400 focus:ring-opacity-50">
+                    <button 
+                        onClick={handleExtract} 
+                        disabled={!isPaperDetected}
+                        className="flex items-center gap-3 px-8 py-4 bg-teal-500 hover:bg-teal-600 text-white text-lg font-bold rounded-full shadow-lg transition-all transform hover:scale-105 focus:outline-none focus:ring-4 focus:ring-teal-400 focus:ring-opacity-50 disabled:bg-gray-500 disabled:opacity-70 disabled:cursor-not-allowed disabled:transform-none"
+                        aria-label="Extract Document"
+                    >
                         <CameraIcon className="w-7 h-7" />
                         Extract Document
                     </button>
